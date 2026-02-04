@@ -66,12 +66,20 @@
   const $ = (id) => document.getElementById(id);
 
   function guessChain(addr){
-    addr = (addr||"").trim();
-    if(/^0x[a-fA-F0-9]{40}$/.test(addr)) return "ethereum"; // default EVM
-    // Solana base58 tipično 32-44 znakova (nije savršeno)
-    if(/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(addr)) return "solana";
-    return "auto";
-  }
+  addr = (addr||"").trim();
+
+  // Pump.fun / Solana mint često završava s "pump"
+  if (/^[1-9A-HJ-NP-Za-km-z]{32,60}pump$/i.test(addr)) return "solana";
+
+  // EVM contract
+  if(/^0x[a-fA-F0-9]{40}$/.test(addr)) return "ethereum";
+
+  // Solana base58 (mint)
+  if(/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(addr)) return "solana";
+
+  return "auto";
+}
+
 
   function pillClass(score){
     if(score >= 70) return "pill ok";
@@ -121,3 +129,4 @@
 </script>
 </body>
 </html>
+
