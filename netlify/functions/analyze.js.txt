@@ -7,15 +7,24 @@ export async function handler(event) {
     const { chain, token } = JSON.parse(event.body || "{}");
     if (!token) return json(400, { error: "Missing token" });
 
-    const cleaned = String(token).trim();
+   let cleaned = String(token).trim();
+
+// makni whitespace unutar stringa (nekad ljudi zalijepe s razmakom)
+cleaned = cleaned.replace(/\s+/g, "");
+
+// Ako završava s "pump" tretiraj kao Solana mint (Pump.fun)
+const isPumpMint = /^[1-9A-HJ-NP-Za-km-z]{32,60}pump$/i.test(cleaned);
+
     let usedChain = (chain || "auto").trim().toLowerCase();
 
     // Heuristika chain-a ako je auto
     if (usedChain === "auto") {
-      if (/^0x[a-fA-F0-9]{40}$/.test(cleaned)) usedChain = "ethereum";
-      else if (/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(cleaned)) usedChain = "solana";
-      else usedChain = "solana"; // fallback
-    }
+  if (isPumpMint) usedChain = "solana";
+  else if (/^0x[a-fA-F0-9]{40}$/.test(cleaned)) usedChain = "ethereum";
+  else if (/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(cleaned)) usedChain = "solana";
+  else usedChain = "solana";
+}
+
 
     // 1) DexScreener market podaci (token -> poolovi)
     // https://api.dexscreener.com/token-pairs/v1/{chainId}/{tokenAddress}
@@ -220,3 +229,4 @@ function scoreAll({ chain, best, security }){
     }
   };
 }
+
