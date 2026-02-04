@@ -103,12 +103,23 @@
     $("go").disabled = true;
     try{
       const res = await fetch("/.netlify/functions/analyze", {
-        method:"POST",
-        headers:{ "Content-Type":"application/json" },
-        body: JSON.stringify({ chain, token })
-      });
-      const data = await res.json();
-      if(!res.ok) throw new Error(data?.error || "Greška");
+  method:"POST",
+  headers:{ "Content-Type":"application/json" },
+  body: JSON.stringify({ chain, token })
+});
+
+const text = await res.text(); // prvo čitaj kao text
+let data = null;
+
+try {
+  data = text ? JSON.parse(text) : null;
+} catch (e) {
+  throw new Error(`Server nije vratio JSON. Status: ${res.status}. Odgovor: ${text.slice(0,200)}`);
+}
+
+if(!res.ok){
+  throw new Error(data?.error || `Greška. Status: ${res.status}`);
+}
 
       $("out").style.display = "block";
       $("score").textContent = data.score;
@@ -129,4 +140,5 @@
 </script>
 </body>
 </html>
+
 
