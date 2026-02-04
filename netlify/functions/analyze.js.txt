@@ -1,0 +1,222 @@
+// netlify/functions/analyze.js
+export async function handler(event) {
+  try {
+    if (event.httpMethod !== "POST") {
+      return json(405, { error: "Method not allowed" });
+    }
+    const { chain, token } = JSON.parse(event.body || "{}");
+    if (!token) return json(400, { error: "Missing token" });
+
+    const cleaned = String(token).trim();
+    let usedChain = (chain || "auto").trim().toLowerCase();
+
+    // Heuristika chain-a ako je auto
+    if (usedChain === "auto") {
+      if (/^0x[a-fA-F0-9]{40}$/.test(cleaned)) usedChain = "ethereum";
+      else if (/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(cleaned)) usedChain = "solana";
+      else usedChain = "solana"; // fallback
+    }
+
+    // 1) DexScreener market podaci (token -> poolovi)
+    // https://api.dexscreener.com/token-pairs/v1/{chainId}/{tokenAddress}
+    const dsUrl = `https://api.dexscreener.com/token-pairs/v1/${encodeURIComponent(usedChain)}/${encodeURIComponent(cleaned)}`;
+    const ds = await fetchJson(dsUrl);
+
+    // Odaberi "najbolji" par: najveća likvidnost
+    const pairs = Array.isArray(ds) ? ds : (ds?.pairs || []);
+    const best = (pairs || []).slice().sort((a,b) => (b?.liquidity?.usd||0) - (a?.liquidity?.usd||0))[0] || null;
+
+    // 2) Chain-spec security
+    let security = null;
+    if (usedChain === "solana") {
+      // RugCheck Swagger: api.rugcheck.xyz (endpointi se vide u swagger UI)
+      // Često radi: /v1/tokens/{mint}/report
+      const rcUrl = `https://api.rugcheck.xyz/v1/tokens/${encodeURIComponent(cleaned)}/report`;
+      security = await fetchJson(rcUrl, { allowFail:true });
+    } else {
+      // GoPlus token security (EVM) - dokumentacija je na njihovom siteu
+      // Primjer (često): /api/v1/token_security/{chain_id}?contract_addresses=0x...
+      // Mapiramo chain -> GoPlus chain_id
+      const goplusChainId = mapGoPlusChainId(usedChain);
+      if (goplusChainId) {
+        const gpUrl = `https://api.gopluslabs.io/api/v1/token_security/${goplusChainId}?contract_addresses=${encodeURIComponent(cleaned)}`;
+        security = await fetchJson(gpUrl, { allowFail:true });
+      }
+    }
+
+    // 3) Score
+    const { score, verdict, headline, summary, details } = scoreAll({ chain: usedChain, best, security });
+
+    return json(200, { chain: usedChain, score, verdict, headline, summary, details });
+
+  } catch (e) {
+    return json(500, { error: e.message || "Unknown error" });
+  }
+}
+
+function json(statusCode, body){
+  return {
+    statusCode,
+    headers: {
+      "Content-Type":"application/json",
+      "Access-Control-Allow-Origin":"*",
+      "Access-Control-Allow-Headers":"Content-Type"
+    },
+    body: JSON.stringify(body)
+  };
+}
+
+async function fetchJson(url, opts = {}){
+  const res = await fetch(url, { headers: { "Accept":"application/json" } });
+  if (!res.ok) {
+    if (opts.allowFail) return { _error: `HTTP ${res.status}`, _url: url };
+    throw new Error(`Fetch failed ${res.status} for ${url}`);
+  }
+  return await res.json();
+}
+
+function mapGoPlusChainId(chain){
+  // najčešći GoPlus chain_id (možeš proširit)
+  // ETH 1, BSC 56, Polygon 137, Arbitrum 42161, Base 8453, Avalanche 43114
+  const m = {
+    ethereum: "1",
+    bsc: "56",
+    polygon: "137",
+    arbitrum: "42161",
+    base: "8453",
+    avalanche: "43114",
+  };
+  return m[chain] || null;
+}
+
+function clamp(n,min,max){ return Math.max(min, Math.min(max, n)); }
+
+function scoreAll({ chain, best, security }){
+  let score = 50; // start neutral
+  const reasons = [];
+  const redFlags = [];
+  const greenFlags = [];
+
+  // ---- DexScreener signals
+  if (!best) {
+    score -= 20;
+    redFlags.push("Nema pronađenih poolova na DexScreeneru (ili chain mismatch).");
+  } else {
+    const liq = best?.liquidity?.usd || 0;
+    const vol24 = best?.volume?.h24 || 0;
+    const pc5m = best?.priceChange?.m5 ?? null;
+    const pc1h = best?.priceChange?.h1 ?? null;
+    const pc24 = best?.priceChange?.h24 ?? null;
+    const fdv = best?.fdv || 0;
+
+    // Likvidnost
+    if (liq >= 200000) { score += 18; greenFlags.push(`Likvidnost jaka ($${Math.round(liq).toLocaleString()}).`); }
+    else if (liq >= 50000) { score += 10; greenFlags.push(`Likvidnost OK ($${Math.round(liq).toLocaleString()}).`); }
+    else if (liq >= 20000) { score += 2; reasons.push(`Likvidnost osrednja ($${Math.round(liq).toLocaleString()}).`); }
+    else { score -= 18; redFlags.push(`Likvidnost niska ($${Math.round(liq).toLocaleString()}) → veći rug-risk.`); }
+
+    // Volume
+    if (vol24 >= 500000) { score += 10; greenFlags.push(`Volumen 24h jak ($${Math.round(vol24).toLocaleString()}).`); }
+    else if (vol24 >= 100000) { score += 6; greenFlags.push(`Volumen 24h dobar ($${Math.round(vol24).toLocaleString()}).`); }
+    else if (vol24 >= 20000) { score += 1; reasons.push(`Volumen 24h slabiji ($${Math.round(vol24).toLocaleString()}).`); }
+    else { score -= 8; redFlags.push(`Volumen 24h vrlo nizak ($${Math.round(vol24).toLocaleString()}).`); }
+
+    // FDV/Liq ratio (grubi risk)
+    if (fdv && liq) {
+      const ratio = fdv / liq;
+      if (ratio > 200) { score -= 12; redFlags.push(`FDV/LP omjer ekstreman (${ratio.toFixed(1)}).`); }
+      else if (ratio > 80) { score -= 7; redFlags.push(`FDV/LP omjer visok (${ratio.toFixed(1)}).`); }
+      else if (ratio < 20) { score += 4; greenFlags.push(`FDV/LP omjer zdrav (${ratio.toFixed(1)}).`); }
+    }
+
+    // Pump spike heuristika
+    const spike = (pc5m !== null && pc5m > 60) || (pc1h !== null && pc1h > 180);
+    if (spike && vol24 < 50000) { score -= 10; redFlags.push("Brz pump uz slab volume → često dump/rug scena."); }
+    if (pc24 !== null && pc24 > 30) { score += 3; reasons.push(`Momentum 24h: +${pc24}%`); }
+    if (pc24 !== null && pc24 < -40) { score -= 5; reasons.push(`Pad 24h: ${pc24}%`); }
+  }
+
+  // ---- Security signals
+  if (chain === "solana") {
+    // RugCheck report (format može varirati)
+    if (security?._error) {
+      reasons.push("RugCheck nije vratio report (mogući CORS/limit ili token nepoznat).");
+    } else if (security) {
+      // pokušaj izvući neki risk score/label
+      const label = security?.risk?.label || security?.risk?.name || security?.status || null;
+      const riskScore = security?.risk?.score ?? security?.score ?? null;
+
+      if (typeof riskScore === "number") {
+        if (riskScore >= 80) { score -= 18; redFlags.push(`RugCheck risk score visok (${riskScore}).`); }
+        else if (riskScore >= 60) { score -= 10; redFlags.push(`RugCheck risk score povišen (${riskScore}).`); }
+        else if (riskScore <= 30) { score += 8; greenFlags.push(`RugCheck risk score nizak (${riskScore}).`); }
+        else reasons.push(`RugCheck risk score: ${riskScore}.`);
+      } else if (label) {
+        reasons.push(`RugCheck label: ${label}`);
+      }
+
+      // često imaju flags / warnings polje
+      const warnings = security?.warnings || security?.risks || security?.flags;
+      if (Array.isArray(warnings) && warnings.length) {
+        // ako ima puno warninga, penaliziraj
+        if (warnings.length >= 5) { score -= 8; redFlags.push(`RugCheck upozorenja: ${warnings.length}`); }
+        else { score -= 3; reasons.push(`RugCheck upozorenja: ${warnings.length}`); }
+      }
+    }
+  } else {
+    // GoPlus: tražimo poznate red flags u payload-u
+    if (security?._error) {
+      reasons.push("GoPlus nije vratio podatke (token možda nije podržan ili limit).");
+    } else {
+      const result = security?.result;
+      const firstKey = result && typeof result === "object" ? Object.keys(result)[0] : null;
+      const t = firstKey ? result[firstKey] : null;
+
+      // Neki česti flagovi (string "1"/"0")
+      const flag = (k) => t && (t[k] === "1" || t[k] === 1 || t[k] === true);
+
+      if (t) {
+        if (flag("is_honeypot")) { score -= 30; redFlags.push("GoPlus: honeypot flag."); }
+        if (flag("cannot_sell_all")) { score -= 18; redFlags.push("GoPlus: cannot_sell_all (sell restriction)."); }
+        if (flag("is_blacklisted")) { score -= 18; redFlags.push("GoPlus: blacklist flag."); }
+        if (flag("owner_change_balance")) { score -= 22; redFlags.push("GoPlus: owner može mijenjat balance."); }
+        if (flag("selfdestruct")) { score -= 10; redFlags.push("GoPlus: selfdestruct mogućnost."); }
+        if (flag("transfer_pausable")) { score -= 10; redFlags.push("GoPlus: transfer pausable."); }
+
+        // Pozitivno: locked liquidity / renounced (ako postoji)
+        if (flag("is_open_source")) { score += 3; greenFlags.push("GoPlus: open source contract."); }
+        if (flag("is_proxy")) { score -= 5; reasons.push("GoPlus: proxy contract (više rizika/kompleksnosti)."); }
+      }
+    }
+  }
+
+  score = clamp(Math.round(score), 0, 100);
+
+  let verdict = "Neutral / Oprez";
+  let headline = "Nema jasnog edge-a";
+  if (score >= 70) { verdict = "Bullish-ish"; headline = "Izgleda zdravije od prosjeka"; }
+  else if (score <= 35) { verdict = "Rug-risk"; headline = "Povišen rizik (mogući scam/rug)"; }
+
+  const summary = [
+    redFlags.length ? `🚩 Red flags: ${redFlags.length}` : "✅ Nema velikih red flagova",
+    greenFlags.length ? `🟢 Green: ${greenFlags.length}` : "🟡 Malo pozitivnih signala",
+  ].join(" • ");
+
+  return {
+    score, verdict, headline, summary,
+    details: {
+      pickedPair: best ? {
+        dexId: best.dexId,
+        pairAddress: best.pairAddress,
+        baseToken: best.baseToken,
+        quoteToken: best.quoteToken,
+        liquidityUSD: best?.liquidity?.usd,
+        volume24h: best?.volume?.h24,
+        priceChange: best?.priceChange,
+        fdv: best?.fdv
+      } : null,
+      redFlags, greenFlags, reasons,
+      securityRaw: security
+    }
+  };
+}

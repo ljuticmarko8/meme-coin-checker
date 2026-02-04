@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="hr">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Meme Coin Checker</title>
+  <style>
+    body { font-family: system-ui, Arial; margin: 0; padding: 24px; background:#0b0f17; color:#e8eefc; }
+    .wrap { max-width: 880px; margin: 0 auto; }
+    .card { background:#121a2a; border:1px solid #1f2b45; border-radius:14px; padding:16px; margin-top:14px; }
+    input, select, button { padding:12px 12px; border-radius:12px; border:1px solid #2a3a5c; background:#0f1626; color:#e8eefc; }
+    input { width: 100%; box-sizing: border-box; }
+    button { cursor:pointer; font-weight:600; }
+    button:disabled { opacity:0.6; cursor:not-allowed; }
+    .row { display:grid; grid-template-columns: 1fr 180px 140px; gap:10px; }
+    @media (max-width: 720px){ .row{ grid-template-columns:1fr; } }
+    .pill { display:inline-block; padding:6px 10px; border-radius:999px; border:1px solid #2a3a5c; background:#0f1626; }
+    .ok { border-color:#2c8a4a; }
+    .warn { border-color:#b68b2c; }
+    .bad { border-color:#b23b3b; }
+    pre { white-space: pre-wrap; word-break: break-word; background:#0f1626; border:1px solid #2a3a5c; padding:12px; border-radius:12px; }
+    .muted { color:#a8b4d6; font-size: 14px; }
+    .big { font-size: 26px; font-weight: 800; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>🧪 Meme Coin Checker</h1>
+    <p class="muted">Zalijepi token adresu (ili pair). Dobiješ heuristički score (nije financijski savjet).</p>
+
+    <div class="card">
+      <div class="row">
+        <input id="token" placeholder="npr. Solana token: A55X...  |  ETH token: 0x..." />
+        <select id="chain">
+          <option value="auto" selected>AUTO</option>
+          <option value="solana">Solana</option>
+          <option value="ethereum">Ethereum</option>
+          <option value="bsc">BSC</option>
+          <option value="base">Base</option>
+          <option value="arbitrum">Arbitrum</option>
+          <option value="polygon">Polygon</option>
+          <option value="avalanche">Avalanche</option>
+        </select>
+        <button id="go">Analyze</button>
+      </div>
+      <p class="muted">Tip: AUTO radi dobro kad je adresa očito Solana (base58) ili EVM (0x...).</p>
+    </div>
+
+    <div id="out" class="card" style="display:none;">
+      <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+        <div id="verdict" class="pill">...</div>
+        <div class="pill">Score: <b id="score">-</b>/100</div>
+        <div class="pill">Chain: <b id="chainOut">-</b></div>
+      </div>
+      <div class="big" id="headline" style="margin-top:10px;">-</div>
+      <p class="muted" id="summary">-</p>
+
+      <div class="card" style="background:#0f1626;">
+        <h3 style="margin:0 0 8px;">Detalji</h3>
+        <pre id="details">-</pre>
+      </div>
+    </div>
+  </div>
+
+<script>
+  const $ = (id) => document.getElementById(id);
+
+  function guessChain(addr){
+    addr = (addr||"").trim();
+    if(/^0x[a-fA-F0-9]{40}$/.test(addr)) return "ethereum"; // default EVM
+    // Solana base58 tipično 32-44 znakova (nije savršeno)
+    if(/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(addr)) return "solana";
+    return "auto";
+  }
+
+  function pillClass(score){
+    if(score >= 70) return "pill ok";
+    if(score >= 40) return "pill warn";
+    return "pill bad";
+  }
+
+  $("token").addEventListener("input", () => {
+    if($("chain").value === "auto"){
+      const g = guessChain($("token").value);
+      if(g !== "auto") $("chain").value = g;
+    }
+  });
+
+  $("go").addEventListener("click", async () => {
+    const token = $("token").value.trim();
+    let chain = $("chain").value;
+    if(!token){ alert("Zalijepi adresu tokena/paira."); return; }
+    if(chain === "auto") chain = guessChain(token);
+
+    $("go").disabled = true;
+    try{
+      const res = await fetch("/.netlify/functions/analyze", {
+        method:"POST",
+        headers:{ "Content-Type":"application/json" },
+        body: JSON.stringify({ chain, token })
+      });
+      const data = await res.json();
+      if(!res.ok) throw new Error(data?.error || "Greška");
+
+      $("out").style.display = "block";
+      $("score").textContent = data.score;
+      $("chainOut").textContent = data.chain;
+      $("headline").textContent = data.headline;
+      $("summary").textContent = data.summary;
+      $("details").textContent = JSON.stringify(data.details, null, 2);
+
+      const v = $("verdict");
+      v.className = pillClass(data.score);
+      v.textContent = data.verdict;
+    }catch(e){
+      alert(e.message || "Greška");
+    }finally{
+      $("go").disabled = false;
+    }
+  });
+</script>
+</body>
+</html>
